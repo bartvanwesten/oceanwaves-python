@@ -23,6 +23,8 @@ import oceanwaves.oceanwaves
 TABLE_UNITS_FILE = 'table_units.json'
 SWAN_TIME_FORMAT = '%Y%m%d.%H%M%S'
 
+# Test
+
 
 class SwanBlockReader:
     '''Class for memory efficient reading of large files.
