@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from collections import OrderedDict
+import netCDF4
 
 try:
     import pyproj
@@ -22,9 +23,6 @@ import oceanwaves.oceanwaves
 
 TABLE_UNITS_FILE = 'table_units.json'
 SWAN_TIME_FORMAT = '%Y%m%d.%H%M%S'
-
-# Test
-
 
 class SwanBlockReader:
     '''Class for memory efficient reading of large files.
@@ -256,7 +254,6 @@ class SwanBlockReader:
     
 class SwanSpcReader:
 
-
     def __init__(self):
 
         self.stationairy = True
@@ -272,11 +269,12 @@ class SwanSpcReader:
     def __call__(self, fpath):
 
         self.reset()
+
         return self.read(fpath)
 
-        
+
     def reset(self):
-        
+
         self.stationary = True
         self.directional = False
 
@@ -292,16 +290,18 @@ class SwanSpcReader:
         self.quantities = []
 
         self.l = 0 # location counter
-        
 
     def read(self, fpath):
 
         for fname in glob.glob(fpath):
-            self.readfile(fname)
+            if fname.lower().endswith('.nc'):
+                self.readnetcdf(fname)
+            else:
+                self.readfile(fname)
 
         return self.to_oceanwaves()
 
-        
+
     def readfile(self, fpath):
 
         self.lines = SwanBlockReader.open(fpath)
@@ -356,6 +356,44 @@ class SwanSpcReader:
 
         self.lines.close()
 
+    def readnetcdf(self, fpath):
+
+        with netCDF4.Dataset(fpath, 'r') as ds:
+
+            # Read conventions etc.
+
+            self.direction_convention = ds.Directional_convention
+            self.locations = np.column_stack((ds.variables['longitude'][:], ds.variables['latitude'][:]))
+            self.crs = 'epsg:4326' # Currently only LONLAT supported, XY has to be implemented
+            self.frequencies = ds.variables['frequency'][:]
+            self.frequency_convention = 'absolute'  # Currently only absolute supported, relative has to be implemented
+            # self.specs = ... OrderedDict([('VaDens', {'units': 'm2/Hz', 'fill_value': '-0.9900E+02'}), ('NDIR', {'units': 'degr', 'fill_value': '-0.9990E+03'})])
+            self.directions = []  # Only yet for 1D
+
+            if ds.dimensions['time'].size > 0:
+                self.stationary = False
+
+            # Read data
+
+            timesteps = np.arange(0, ds.variables['energy_1d'][:].shape[0])
+            locations = np.arange(0, ds.variables['energy_1d'][:].shape[1])
+            frequencies = np.arange(0, ds.variables['energy_1d'][:].shape[2])
+
+            q = np.zeros((frequencies.shape[0], 3))
+
+            for t in timesteps:
+
+                self.quantities.append([])
+                self.time.append(datetime.fromtimestamp(ds.variables['time'][t]))
+
+                for l in locations:
+
+                    q[:, 0] = ds.variables['energy_1d'][t, l, :]
+                    q[:, 1] = ds.variables['theta_1d'][t, l, :]
+                    q[:, 2] = ds.variables['spread_1d'][t, l, :]
+
+                    self.quantities[-1].append(q.copy())
+
 
     def to_oceanwaves(self):
 
@@ -364,7 +402,7 @@ class SwanSpcReader:
             if 'units' in specs.keys():
                 energy_units = specs['units']
                 break
-            
+
         kwargs = dict(
             location=self.locations,
             location_units='m' if self.crs is None else 'deg',
@@ -407,7 +445,7 @@ class SwanSpcReader:
 
         return oceanwaves.oceanwaves.OceanWaves(**kwargs)
 
-            
+
     def parse_comments(self):
         self.comments.append(self.lines[0][1:].strip())
 
@@ -428,7 +466,7 @@ class SwanSpcReader:
             'exhaustive data format description or working implementation.'
         )
 
-    
+
     def parse_time(self):
         m = re.match('\s*([^\s]+)', self.lines[1])
         if m:
@@ -505,11 +543,23 @@ class SwanSpcReader:
 
         n = len(self.frequencies)
         q = np.asarray(self.lines.read_blockbody(n)) * f
+
+        # NEW! REPLACE FILL_VALUES BY NEW VALUES ( == 0 )
+
+        new_fill = 0
+        fill_value = []
+        i_var = 0
+
+        for var, specs in self.specs.items():
+            if 'fill_value' in specs.keys():
+                fill_value.append(float(specs['fill_value']))
+                q[:, i_var] = [new_fill if x == fill_value[i_var] else x for x in q[:, i_var]]
+                i_var += 1
+
         if self.stationary:
             self.quantities.append(q)
         else:
             self.quantities[-1].append(q)
-
 
     def parse_nodata(self, fill_value=np.nan):
         if self.directional:
@@ -524,7 +574,6 @@ class SwanSpcReader:
             self.quantities.append(q)
         else:
             self.quantities[-1].append(q)
-
 
     def parse_timestamp(self):
         m = re.match('\s*([\d\.]+)', self.lines[0])
@@ -962,6 +1011,186 @@ class SwanTableReader:
     def get_units(self):
         '''Read relevant units from JSON file'''
         
+        jsonpath = os.path.join(os.path.split(__file__)[0], TABLE_UNITS_FILE)
+        if os.path.exists(jsonpath):
+            with open(jsonpath, 'r') as fp:
+                self.units = [u for c, u in json.load(fp).items() if c in self.columns]
+
+
+class Swan2DReader: # Still same as TableReader
+
+    def __init__(self):
+
+        pass
+
+    def __call__(self, fpath, columns=[], time_var='Time',
+                 location_vars=['Xp', 'Yp'], frequency_var='RTpeak',
+                 direction_var='Dir', energy_var='Hsig', **kwargs):
+
+        # clear variables
+        self.headers = []
+        self.columns = []
+        self.units = []
+        self.data = []
+        self.attrs = {}
+
+        # assume columns names and units
+        self.columns = columns
+        self.get_units()
+
+        # read data, column names and units from file
+        self.read(fpath)
+        self.parse_headers()
+        self.check_integrity()
+
+        return self.to_oceanwaves(
+            energy_var=energy_var,
+            time_var=time_var,
+            **kwargs
+        )
+
+    def to_oceanwaves(self, time_var='Time',
+                      location_vars=['Xp', 'Yp'], period_var='RTpeak',
+                      frequency_var=None, direction_var='Dir',
+                      energy_var='Hsig', **kwargs):
+
+        '''Converts raw data in OceanWaves object
+
+        Converts raw data and column names into Pandas
+        DataFrame. Groups the DataFrame by time and location. Converts
+        the MultiIndex DataFrame into an xarray Dataset. Adds unit
+        information as attributes and uses the resulting Dataset to
+        initialize a OceanWaves object.
+
+        See for possible initialization arguments the
+        :class:`OceanWaves` class.
+
+        Returns
+        -------
+        OceanWaves
+            OceanWaves object.
+
+        '''
+
+        df = pd.DataFrame(self.data, columns=self.columns)
+
+        # group by time
+        if time_var in df.columns:
+            df[time_var] = ([datetime.strptime('%15.6f' % t, SWAN_TIME_FORMAT)
+                             for t in df[time_var].values])
+            dfs1 = []
+            grouped = df.groupby(time_var)
+            for t, group in grouped:
+                group.set_index(time_var, drop=True, append=True, inplace=True)
+                dfs1.append(group)
+        else:
+            dfs1 = [df]
+
+        # group by location
+        if all([v in df.columns for v in location_vars]):
+            dfs2 = []
+            for df in dfs1:
+                grouped = df.groupby(location_vars)
+                for (x, y), group in grouped:
+                    group = group.copy()
+                    group['Location'] = [(x, y)] * len(group)
+                    group.drop(location_vars, axis=1, inplace=True)
+                    group.set_index('Location', drop=True, append=True, inplace=True)
+                    dfs2.append(group)
+        else:
+            dfs2 = dfs1
+
+        # concatenate per time/location dataframes and reset index
+        df = pd.concat(dfs2, axis=0)
+        df = df.reset_index(0, drop=True)
+
+        # convert period to frequency
+        if frequency_var is None:
+            frequency_var = 'Freq'
+            df[frequency_var] = 1. / df[period_var]
+
+        # convert dataframe to dataset and add units
+        xa = df.to_xarray()
+        for k in xa.variables.keys():
+            if k in self.columns:
+                ix = self.columns.index(k)
+                xa.variables[k].attrs['units'] = self.units[ix]
+            elif k == 'Location':
+                units = set()
+                for v in location_vars:
+                    ix = self.columns.index(v)
+                    units.add(self.units[ix])
+                if len(units) == 1:
+                    xa.variables[k].attrs['units'] = units.pop()
+                else:
+                    raise ValueError('Inconsistent units for location coordinates.')
+            else:
+                xa.variables[k].attrs['units'] = '1'
+
+        # convert dataset to oceanwaves object
+        return oceanwaves.OceanWaves.from_dataset(
+            xa,
+            time_var=time_var,
+            location_var='Location',
+            frequency_var=frequency_var,
+            direction_var=direction_var,
+            energy_var=energy_var,
+            **kwargs
+        )
+
+    def read(self, fpath):
+        '''Read headers and data seperately'''
+
+        with open(fpath, 'r') as fp:
+            for line in fp:
+                if line.startswith('%'):
+                    self.headers.append(line[1:].strip())
+                else:
+                    self.data.append([float(x) for x in line.split()])
+
+        self.data = np.asarray(self.data)
+
+    def parse_headers(self):
+        '''Parse headers into attributes, units and column names'''
+
+        for line in self.headers:
+            if len(line) == 0:
+                continue
+            elif ':' in line:
+                self.attrs.update(dict([re.split('\s*:\s*', x)
+                                        for x in re.split('\s{2,}', line)]))
+            elif re.search('\[\S*\]', line):
+                self.units = re.findall('\[\s*(\S*)\s*\]', line)
+            else:
+                self.columns = re.split('\s+', line)
+
+    def check_integrity(self):
+        '''Check integrity of parsed data
+
+        Raises
+        ------
+        ValueError
+            If no columns are specified when using NOHEAD option or if
+            the number of column names or units do not match the
+            number of data columns.
+
+        '''
+
+        if not self.columns:
+            raise ValueError('Column names must be specified '
+                             'when using \'NOHEAD\' option.')
+        if self.data.shape[1] != len(self.columns):
+            raise ValueError('Number of column names (%d) does not match '
+                             'number of data columns (%d).' % (self.data.shape[1],
+                                                               len(self.columns)))
+        if self.data.shape[1] != len(self.units):
+            raise ValueError('Number of units (%d) does not match '
+                             'number of data columns (%d).' % (self.data.shape[1],
+                                                               len(self.units)))
+
+    def get_units(self):
+        '''Read relevant units from JSON file'''
+
         jsonpath = os.path.join(os.path.split(__file__)[0], TABLE_UNITS_FILE)
         if os.path.exists(jsonpath):
             with open(jsonpath, 'r') as fp:

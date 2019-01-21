@@ -63,8 +63,9 @@ class OceanWaves(xr.Dataset):
 
     '''
 
-    from_swan = SwanSpcReader()
-    from_swantable = SwanTableReader()
+    SwanSpcReader = SwanSpcReader()
+    SwanTableReader = SwanTableReader()
+    Swan2DReader = Swan2DReader()
     from_datawell = DatawellReader()
     from_wavedroid = WaveDroidReader()
 
